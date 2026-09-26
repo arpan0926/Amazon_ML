@@ -1,0 +1,6 @@
+catboost==1.2.8
+duckdb==1.4.3
+numpy==2.2.6
+pandas==2.3.3
+rapidfuzz==3.14.3
+scikit-learn==1.7.2

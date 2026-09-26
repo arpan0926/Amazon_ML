@@ -1,0 +1,23 @@
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local challenge data and macOS archive metadata
+/student_resource/dataset/
+/dataset/
+/__MACOSX/
+.DS_Store
+Thumbs.db
+
+# Generated outputs, indexes, and submission archives
+/output/
+/matching_results.tsv
+*_submission.zip
+*.sqlite3
+*.duckdb
