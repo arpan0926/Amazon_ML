@@ -5,6 +5,7 @@ import gc
 import re
 import subprocess
 import sys
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 
 
 ID_COLUMN = "entity_id"
@@ -30,14 +31,102 @@ FEATURE_COLUMNS = [
     "name_length_diff",
     "address_length_diff",
     "address_digit_match",
+    "exact_name_key_match",
+    "word_digit_key_match",
+    "exact_address_key_match",
+    "legal_name_key_match",
+    "blocking_key_match_count",
+    "legal_name_similarity",
 ]
-DIGIT_PATTERN = re.compile(r"\d+")
+SENSITIVITY_SAMPLE_SIZES = (10_000, 50_000, 100_000)
+THRESHOLD_SWEEP_MIN = 0.01
+THRESHOLD_SWEEP_MAX = 0.95
+THRESHOLD_SWEEP_STEP = 0.01
+RELATIVE_CONFIDENCE_GRID = (0.0, 0.5, 0.7, 0.8, 0.9, 0.95)
+RELATIVE_CONFIDENCE_GRID = (0.0, 0.5, 0.7, 0.8, 0.9, 0.95)
+DIGIT_PATTERN = re.compile(r"[0-9]+")
+FIRST_WORD_PATTERN = re.compile(r"^[^\W_]+", flags=re.UNICODE)
+TEXT_SEPARATOR_PATTERN = re.compile(r"[\W_]+", flags=re.UNICODE)
+ADDRESS_TOKEN_ALIASES = (
+    ("street", "st"),
+    ("road", "rd"),
+    ("avenue", "ave"),
+    ("boulevard", "blvd"),
+    ("drive", "dr"),
+    ("lane", "ln"),
+    ("highway", "hwy"),
+    ("suite", "ste"),
+    ("apartment", "apt"),
+)
+ADDRESS_TOKEN_ALIAS_MAP = dict(ADDRESS_TOKEN_ALIASES)
+LEGAL_SUFFIX_PATTERN = r"[,\. ]+(incorporated|inc[.]?|llc|ltd[.]?|limited|corp[.]?|corporation|gmbh|co[.]?|pvt[.]?|private)[,\. ]*$"
+LEGAL_SUFFIX_REGEX = re.compile(LEGAL_SUFFIX_PATTERN)
 
 
 def require_columns(frame, required, label):
     missing = sorted(set(required) - set(frame.columns))
     if missing:
         raise ValueError(f"{label} is missing required columns: {missing}")
+
+
+def _strip_legal_suffix(value):
+    normalized = _normalize_name(value)
+    for _ in range(2):
+        normalized = LEGAL_SUFFIX_REGEX.sub("", normalized).strip()
+    return normalized
+
+
+def _normalize_name(value):
+    if value is None or pd.isna(value):
+        return ""
+    normalized = unicodedata.normalize("NFC", str(value)).lower()
+    normalized = unicodedata.normalize("NFC", normalized).replace("&", " and ")
+    return " ".join(TEXT_SEPARATOR_PATTERN.sub(" ", normalized).split())
+
+
+def _normalize_address(value):
+    normalized = _normalize_name(value)
+    if not normalized:
+        return ""
+    return " ".join(
+        ADDRESS_TOKEN_ALIAS_MAP.get(token, token)
+        for token in normalized.split()
+    )
+
+
+def _sql_normalized_text(column_name, is_address=False):
+    expression = (
+        f"trim(regexp_replace("
+        f"replace(nfc_normalize(lower(coalesce({column_name}, ''))), '&', ' and '), "
+        f"'[^\\p{{L}}\\p{{N}}]+', ' ', 'g'))"
+    )
+    if not is_address:
+        return expression
+    padded_expression = f"' ' || ({expression}) || ' '"
+    for full, abbreviation in ADDRESS_TOKEN_ALIASES:
+        padded_expression = (
+            f"replace({padded_expression}, ' {full} ', ' {abbreviation} ')"
+        )
+    return f"trim({padded_expression})"
+
+
+def _blocking_key_values(name, address):
+    normalized_name = _normalize_name(name)
+    normalized_address = _normalize_address(address)
+    first_word_match = FIRST_WORD_PATTERN.search(normalized_name)
+    first_number_match = DIGIT_PATTERN.search(str(address))
+    word_digit_key = (
+        f"{first_word_match.group(0)}_{first_number_match.group(0)}"
+        if first_word_match and first_number_match
+        else ""
+    )
+    legal_name = _strip_legal_suffix(name)
+    return (
+        normalized_name,
+        word_digit_key,
+        normalized_address,
+        legal_name,
+    )
 
 
 def _create_blocking_keys(con, table_name, id_alias):
@@ -47,17 +136,28 @@ def _create_blocking_keys(con, table_name, id_alias):
         WITH normalized AS (
             SELECT
                 entity_id AS {id_alias},
-                lower(trim(coalesce(business_name, ''))) AS normalized_name,
-                lower(trim(coalesce(business_address, ''))) AS normalized_address,
-                regexp_extract(
-                    lower(trim(coalesce(business_name, ''))), '^[a-z0-9]+', 0
-                ) AS first_word,
+                {_sql_normalized_text('business_name')} AS normalized_name,
+                {_sql_normalized_text('business_address', is_address=True)} AS normalized_address,
+                length({_sql_normalized_text('business_name')}) AS name_length,
+                length({_sql_normalized_text('business_address', is_address=True)}) AS address_length,
+                regexp_extract({_sql_normalized_text('business_name')}, '^[\\p{{L}}\\p{{N}}]+', 0) AS first_word,
                 regexp_extract(coalesce(business_address, ''), '[0-9]+', 0)
                     AS first_number
             FROM {table_name}
+        ), with_legal_name AS (
+            SELECT
+                *,
+                trim(regexp_replace(
+                    regexp_replace(normalized_name, '{LEGAL_SUFFIX_PATTERN}', '', 'g'),
+                    '{LEGAL_SUFFIX_PATTERN}', '', 'g'
+                )) AS legal_name
+            FROM normalized
         )
         SELECT
             {id_alias},
+            normalized_name,
+            normalized_address,
+            legal_name,
             CASE WHEN normalized_name <> ''
                 THEN normalized_name END AS key_exact_name,
             CASE WHEN first_word <> '' AND first_number <> ''
@@ -65,7 +165,10 @@ def _create_blocking_keys(con, table_name, id_alias):
                 AS key_word_digit,
             CASE WHEN normalized_address <> ''
                 THEN normalized_address END AS key_exact_addr
-        FROM normalized
+            ,name_length
+            ,address_length
+            ,CASE WHEN legal_name <> '' THEN legal_name END AS key_legal_name
+        FROM with_legal_name
         """
     )
 
@@ -77,36 +180,98 @@ def _candidate_join_query(con, top_k):
     _create_blocking_keys(con, "vendor", "vendor_entity_id")
     query = """
         WITH candidate_matches AS (
-            SELECT s.source1_entity_id, v.vendor_entity_id
+            SELECT
+                s.source1_entity_id,
+                v.vendor_entity_id,
+                'exact_name' AS blocking_key,
+                abs(s.name_length - v.name_length)
+                    + abs(s.address_length - v.address_length) AS length_gap
             FROM src1_keys s
             JOIN vendor_keys v ON s.key_exact_name = v.key_exact_name
             WHERE s.key_exact_name IS NOT NULL AND s.key_exact_name <> '_'
 
             UNION ALL
 
-            SELECT s.source1_entity_id, v.vendor_entity_id
+            SELECT
+                s.source1_entity_id,
+                v.vendor_entity_id,
+                'word_digit' AS blocking_key,
+                abs(s.name_length - v.name_length)
+                    + abs(s.address_length - v.address_length) AS length_gap
             FROM src1_keys s
             JOIN vendor_keys v ON s.key_word_digit = v.key_word_digit
             WHERE s.key_word_digit IS NOT NULL AND s.key_word_digit <> '_'
 
             UNION ALL
 
-            SELECT s.source1_entity_id, v.vendor_entity_id
+            SELECT
+                s.source1_entity_id,
+                v.vendor_entity_id,
+                'exact_addr' AS blocking_key,
+                abs(s.name_length - v.name_length)
+                    + abs(s.address_length - v.address_length) AS length_gap
             FROM src1_keys s
             JOIN vendor_keys v ON s.key_exact_addr = v.key_exact_addr
             WHERE s.key_exact_addr IS NOT NULL AND s.key_exact_addr <> '_'
+
+            UNION ALL
+
+            SELECT
+                s.source1_entity_id,
+                v.vendor_entity_id,
+                'legal_name' AS blocking_key,
+                abs(s.name_length - v.name_length)
+                    + abs(s.address_length - v.address_length) AS length_gap
+            FROM src1_keys s
+            JOIN vendor_keys v ON s.key_legal_name = v.key_legal_name
+            WHERE s.key_legal_name IS NOT NULL AND s.key_legal_name <> '_'
+
         ), deduplicated AS (
-            SELECT DISTINCT source1_entity_id, vendor_entity_id
+            SELECT
+                source1_entity_id,
+                vendor_entity_id,
+                COUNT(DISTINCT blocking_key) AS matched_key_count,
+                MIN(length_gap) AS length_gap
             FROM candidate_matches
+            GROUP BY source1_entity_id, vendor_entity_id
+        ), scored AS (
+            SELECT
+                d.source1_entity_id,
+                d.vendor_entity_id,
+                d.matched_key_count,
+                d.length_gap,
+                0.7 * CASE
+                    WHEN s.normalized_name <> '' AND v.normalized_name <> ''
+                    THEN greatest(
+                        jaro_winkler_similarity(s.normalized_name, v.normalized_name),
+                        CASE
+                            WHEN s.legal_name <> '' AND v.legal_name <> ''
+                            THEN jaro_winkler_similarity(s.legal_name, v.legal_name)
+                            ELSE 0.0
+                        END
+                    )
+                    ELSE 0.0
+                END
+                + 0.3 * CASE
+                    WHEN s.normalized_address <> '' AND v.normalized_address <> ''
+                    THEN jaro_winkler_similarity(
+                        s.normalized_address, v.normalized_address
+                    )
+                    ELSE 0.0
+                END AS similarity_score
+            FROM deduplicated d
+            JOIN src1_keys s USING (source1_entity_id)
+            JOIN vendor_keys v USING (vendor_entity_id)
         ), ranked AS (
             SELECT
                 source1_entity_id,
                 vendor_entity_id,
                 ROW_NUMBER() OVER (
                     PARTITION BY source1_entity_id
-                    ORDER BY vendor_entity_id
+                    ORDER BY matched_key_count DESC, similarity_score DESC,
+                        length_gap ASC, vendor_entity_id ASC
                 ) AS rn
-            FROM deduplicated
+            FROM scored
         )
         SELECT source1_entity_id, vendor_entity_id
         FROM ranked
@@ -192,10 +357,29 @@ def engineer_features(pairs, chunk_size=50000):
     feature_chunks = []
     for start in range(0, len(pairs), chunk_size):
         chunk = pairs.iloc[start:start + chunk_size]
-        name_left = [value.strip() for value in chunk["name_1"].tolist()]
-        name_right = [value.strip() for value in chunk["name_2"].tolist()]
-        address_left = [value.strip() for value in chunk["address_1"].tolist()]
-        address_right = [value.strip() for value in chunk["address_2"].tolist()]
+        name_left = [_normalize_name(value) for value in chunk["name_1"].tolist()]
+        name_right = [_normalize_name(value) for value in chunk["name_2"].tolist()]
+        address_left = [_normalize_address(value) for value in chunk["address_1"].tolist()]
+        address_right = [_normalize_address(value) for value in chunk["address_2"].tolist()]
+        blocking_keys = [
+            _blocking_key_values(name_1, address_1)
+            for name_1, address_1 in zip(name_left, address_left)
+        ]
+        candidate_keys = [
+            _blocking_key_values(name_2, address_2)
+            for name_2, address_2 in zip(name_right, address_right)
+        ]
+        exact_key_matches = [
+            (
+                bool(left[0]) and left[0] != "_" and left[0] == right[0],
+                bool(left[1]) and left[1] == right[1],
+                bool(left[2]) and left[2] != "_" and left[2] == right[2],
+                bool(left[3]) and left[3] != "_" and left[3] == right[3],
+            )
+            for left, right in zip(blocking_keys, candidate_keys)
+        ]
+        legal_name_left = [keys[3] for keys in blocking_keys]
+        legal_name_right = [keys[3] for keys in candidate_keys]
         values = {
             "name_token_sort_ratio": [
                 fuzz.token_sort_ratio(left, right)
@@ -229,11 +413,33 @@ def engineer_features(pairs, chunk_size=50000):
                 float(bool(set(DIGIT_PATTERN.findall(left)) & set(DIGIT_PATTERN.findall(right))))
                 for left, right in zip(address_left, address_right)
             ],
+            "exact_name_key_match": [float(matches[0]) for matches in exact_key_matches],
+            "word_digit_key_match": [float(matches[1]) for matches in exact_key_matches],
+            "exact_address_key_match": [float(matches[2]) for matches in exact_key_matches],
+            "legal_name_key_match": [float(matches[3]) for matches in exact_key_matches],
+            "blocking_key_match_count": [
+                float(sum(matches)) for matches in exact_key_matches
+            ],
+            "legal_name_similarity": [
+                fuzz.ratio(left, right) if left and right else 0.0
+                for left, right in zip(legal_name_left, legal_name_right)
+            ],
         }
         feature_chunks.append(
             pd.DataFrame(values, index=chunk.index, dtype=np.float32)
         )
-        del values, name_left, name_right, address_left, address_right
+        del (
+            values,
+            name_left,
+            name_right,
+            address_left,
+            address_right,
+            blocking_keys,
+            candidate_keys,
+            exact_key_matches,
+            legal_name_left,
+            legal_name_right,
+        )
         gc.collect()
     if not feature_chunks:
         return pd.DataFrame(index=pairs.index, columns=FEATURE_COLUMNS, dtype=np.float32)
@@ -293,20 +499,86 @@ def macro_f0_5(source1_ids, truth, predictions):
     return float(np.mean(scores)) if scores else 0.0
 
 
-def select_threshold(source1_ids, truth, pairs, probabilities):
-    best_threshold = 0.50
+def _candidate_acceptance_mask(pairs, probabilities, threshold, relative_confidence):
+    probabilities = np.asarray(probabilities)
+    if len(probabilities) != len(pairs):
+        raise ValueError("There must be one probability per candidate pair")
+    if pairs.empty:
+        return np.zeros(0, dtype=bool)
+    group_maximum = pd.Series(probabilities, index=pairs.index).groupby(
+        pairs["source1_entity_id"], sort=False
+    ).transform("max").to_numpy()
+    return (probabilities >= threshold) & (
+        probabilities >= relative_confidence * group_maximum
+    )
+
+
+def select_threshold(source1_ids, truth, pairs, probabilities, random_seed=42):
+    source_groups = np.asarray(list(dict.fromkeys(source1_ids)), dtype=object)
+    if len(source_groups) < 2:
+        raise ValueError("Threshold selection needs at least two Source 1 groups")
+    probabilities = np.asarray(probabilities)
+    if len(probabilities) != len(pairs):
+        raise ValueError("There must be one OOF probability per candidate pair")
+
+    splitter = GroupShuffleSplit(
+        n_splits=1, test_size=0.5, random_state=random_seed
+    )
+    selection_indices, heldout_indices = next(
+        splitter.split(source_groups, groups=source_groups)
+    )
+    selection_ids = source_groups[selection_indices].tolist()
+    heldout_ids = source_groups[heldout_indices].tolist()
+    selection_mask = pairs["source1_entity_id"].isin(selection_ids).to_numpy()
+    heldout_mask = pairs["source1_entity_id"].isin(heldout_ids).to_numpy()
+    selection_pairs = pairs.loc[selection_mask]
+    selection_probabilities = probabilities[selection_mask]
+
+    best_threshold = THRESHOLD_SWEEP_MIN
+    best_relative_confidence = 0.0
     best_score = -1.0
-    thresholds = np.round(np.arange(0.50, 0.951, 0.01), 2)
-    for threshold in thresholds:
-        selected = pairs.loc[probabilities >= threshold]
-        predicted = zip(
-            selected["source1_entity_id"], selected["candidate_entity_id"]
-        )
-        score = macro_f0_5(source1_ids, truth, predicted)
-        if score > best_score or (score == best_score and threshold > best_threshold):
-            best_score = score
-            best_threshold = float(threshold)
-    return best_threshold, best_score
+    thresholds = np.round(
+        np.arange(
+            THRESHOLD_SWEEP_MIN,
+            THRESHOLD_SWEEP_MAX + THRESHOLD_SWEEP_STEP / 2,
+            THRESHOLD_SWEEP_STEP,
+        ),
+        2,
+    )
+    selection_maximum = pd.Series(
+        selection_probabilities, index=selection_pairs.index
+    ).groupby(selection_pairs["source1_entity_id"], sort=False).transform("max").to_numpy()
+    for relative_confidence in RELATIVE_CONFIDENCE_GRID:
+        relative_mask = selection_probabilities >= relative_confidence * selection_maximum
+        for threshold in thresholds:
+            selected = selection_pairs.loc[
+                relative_mask & (selection_probabilities >= threshold)
+            ]
+            predicted = zip(
+                selected["source1_entity_id"], selected["candidate_entity_id"]
+            )
+            score = macro_f0_5(selection_ids, truth, predicted)
+            tie_break = (float(threshold), float(relative_confidence))
+            best_tie_break = (best_threshold, best_relative_confidence)
+            if score > best_score or (score == best_score and tie_break > best_tie_break):
+                best_score = score
+                best_threshold = float(threshold)
+                best_relative_confidence = float(relative_confidence)
+
+    heldout_pairs = pairs.loc[heldout_mask]
+    heldout_relative_mask = _candidate_acceptance_mask(
+        heldout_pairs,
+        probabilities[heldout_mask],
+        best_threshold,
+        best_relative_confidence,
+    )
+    heldout_selected = heldout_pairs.loc[heldout_relative_mask]
+    heldout_predictions = zip(
+        heldout_selected["source1_entity_id"],
+        heldout_selected["candidate_entity_id"],
+    )
+    heldout_score = macro_f0_5(heldout_ids, truth, heldout_predictions)
+    return best_threshold, best_relative_confidence, best_score, heldout_score
 
 
 def _new_classifier(random_seed):
@@ -316,6 +588,7 @@ def _new_classifier(random_seed):
         iterations=800,
         depth=7,
         learning_rate=0.05,
+        auto_class_weights="Balanced",
         loss_function="Logloss",
         random_seed=random_seed,
         verbose=False,
@@ -465,6 +738,78 @@ def _attach_candidate_attributes(source1, vendors, candidate_ids):
     ]
 
 
+def report_sample_sensitivity(
+    source1_path,
+    vendor_paths,
+    ground_truth_path,
+    n_splits,
+    max_candidates,
+    chunk_size,
+    read_chunk_size,
+    random_seed,
+    sample_sizes=SENSITIVITY_SAMPLE_SIZES,
+):
+    """Report nested OOF metrics for several deterministic training sample sizes."""
+    vendors = _load_vendor_table(vendor_paths)
+    results = []
+    for requested_size in sample_sizes:
+        sample = _sample_training_records(
+            source1_path, requested_size, random_seed, read_chunk_size
+        )
+        source_ids = sample[ID_COLUMN].tolist()
+        truth = _load_truth_subset(ground_truth_path, source_ids, read_chunk_size)
+        candidate_ids = generate_candidate_pairs_duckdb(
+            sample, vendors, top_k=max_candidates
+        )
+        pairs = _attach_candidate_attributes(sample, vendors, candidate_ids)
+        if pairs.empty:
+            raise ValueError(
+                f"Blocking produced no candidate pairs for sample size {len(sample)}"
+            )
+        labels = attach_labels(pairs, truth)
+        features = engineer_features(pairs, chunk_size)
+        probabilities = cross_validate_oof(
+            features,
+            labels,
+            pairs["source1_entity_id"].to_numpy(),
+            n_splits,
+            random_seed,
+        )
+        threshold, relative_confidence, selection_score, heldout_score = select_threshold(
+            source_ids, truth, pairs, probabilities, random_seed
+        )
+        result = {
+            "requested_groups": requested_size,
+            "sampled_groups": len(source_ids),
+            "candidate_pairs": len(pairs),
+            "threshold": threshold,
+            "relative_confidence": relative_confidence,
+            "selection_score": selection_score,
+            "heldout_score": heldout_score,
+        }
+        results.append(result)
+        print(
+            f"Sample sensitivity requested={requested_size:,}, "
+            f"used={len(source_ids):,}, candidates={len(pairs):,}: "
+            f"threshold selected on subset A={selection_score:.6f} "
+            f"(threshold={threshold:.2f}, relative={relative_confidence:.2f}); "
+            f"held-out estimate on subset B="
+            f"{heldout_score:.6f}"
+        )
+        del sample, candidate_ids, pairs, labels, features, probabilities
+        gc.collect()
+    del vendors
+    gc.collect()
+    return results
+
+
+def _maybe_report_sample_sensitivity(enabled, report_kwargs):
+    if not enabled:
+        return False
+    report_sample_sensitivity(**report_kwargs)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-dir", default="dataset/train")
@@ -477,6 +822,7 @@ def main():
     parser.add_argument("--read-chunk-size", type=int, default=25000)
     parser.add_argument("--max-training-groups", type=int, default=50000)
     parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--report-sample-sensitivity", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     args = parser.parse_args()
 
@@ -498,6 +844,21 @@ def main():
     for path in required_paths:
         if not path.is_file():
             raise FileNotFoundError(f"Required challenge file not found: {path}")
+
+    sensitivity_args = {
+        "source1_path": train_source1_path,
+        "vendor_paths": train_vendor_paths,
+        "ground_truth_path": ground_truth_path,
+        "n_splits": args.n_splits,
+        "max_candidates": args.max_candidates,
+        "chunk_size": args.chunk_size,
+        "read_chunk_size": args.read_chunk_size,
+        "random_seed": args.random_seed,
+    }
+    if _maybe_report_sample_sensitivity(
+        args.report_sample_sensitivity, sensitivity_args
+    ):
+        return
 
     output_dir.mkdir(parents=True, exist_ok=True)
     train_sample = _sample_training_records(
@@ -528,17 +889,26 @@ def main():
         args.n_splits,
         args.random_seed,
     )
-    threshold, oof_score = select_threshold(
-        sample_ids, truth, train_pairs, oof_probabilities
+    threshold, relative_confidence, selection_score, heldout_score = select_threshold(
+        sample_ids, truth, train_pairs, oof_probabilities, args.random_seed
     )
     oof_output = train_pairs[["source1_entity_id", "candidate_entity_id"]].copy()
     oof_output["label"] = labels
     oof_output["probability"] = oof_probabilities
     oof_output.to_csv(output_dir / "oof_predictions.tsv", sep="\t", index=False)
     del oof_output
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=args.random_seed)
+    selection_indices, heldout_indices = next(
+        splitter.split(np.asarray(sample_ids, dtype=object), groups=sample_ids)
+    )
     print(
-        f"Sampled OOF macro F0.5: {oof_score:.6f} at threshold {threshold:.2f} "
-        f"({len(sample_ids):,} Source 1 groups)"
+        f"Threshold selected on subset A: macro F0.5={selection_score:.6f}; "
+        f"threshold={threshold:.2f}; relative confidence={relative_confidence:.2f}; "
+        f"groups={len(selection_indices):,}"
+    )
+    print(
+        f"Held-out estimate on subset B: macro F0.5={heldout_score:.6f}; "
+        f"groups={len(heldout_indices):,}"
     )
 
     final_model = None
@@ -581,7 +951,9 @@ def main():
             probabilities = final_model.predict_proba(features)[:, 1]
             del features
         accepted = pair_chunk.loc[
-            probabilities >= threshold,
+            _candidate_acceptance_mask(
+                pair_chunk, probabilities, threshold, relative_confidence
+            ),
             ["source1_entity_id", "candidate_entity_id"],
         ]
         for source_id, candidate_id in zip(

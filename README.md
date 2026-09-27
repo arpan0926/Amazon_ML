@@ -31,6 +31,14 @@ The pipeline also accepts explicit `--train-dir`, `--test-dir`, `--ground-truth`
 
 The run invokes `utils/validate_submission.py` (in `student_resource/` in the supplied workspace) after generating both submission files.
 
+To compare training sample-size cost and OOF behavior without running test inference or rewriting submission files, pass:
+
+```powershell
+py -3.13 business_entity_resolution.py --report-sample-sensitivity
+```
+
+This opt-in diagnostic evaluates requested sample sizes of 10k, 50k, and 100k Source 1 groups (capped by the available training data) and prints the selected-subset score and held-out estimate for each. It does not change the default 50k training sample or standard run.
+
 ## Tests
 
 ```powershell

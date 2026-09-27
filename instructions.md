@@ -2,6 +2,7 @@
 
 - All tabular input and output files are tab-separated TSV files. Read them with `pd.read_csv(file, sep='\t')` and write them with `DataFrame.to_csv(file, sep='\t', index=False)`. Preserve IDs as strings where possible.
 - Use only `business_name` and `business_address` for matching features. Do not use external lookups or other data sources. `country` is open-set metadata: never restrict, map, or filter countries; every test Source 1 entity, including France, must be included.
+- Apply consistent preprocessing to both blocking and RapidFuzz inputs: NFC Unicode normalization, lowercase, expand `&` to `and`, replace punctuation with spaces, and collapse whitespace. For addresses, canonicalize only defined whole-token street/suite abbreviations using the same Python/SQL mapping. Treat null/NaN text as empty. Keep original source strings for ID joins and output.
 - Generate candidates with an in-memory DuckDB connection and C++ hash joins over lowercased exact name, first name word plus first address number, and lowercased exact address. Union the three key joins, deduplicate by Source 1/vendor ID, rank by vendor ID, and cap at 30 candidates per Source 1 by default.
 - Always use the C++-backed `rapidfuzz` library for string matching. Never use `fuzzywuzzy` or `difflib`.
 - Never use `df.apply(axis=1)` for string comparison over large dataframes. Build features with list comprehensions and `zip()`, or use `rapidfuzz.process.cdist`.
